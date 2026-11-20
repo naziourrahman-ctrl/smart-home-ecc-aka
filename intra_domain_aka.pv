@@ -1,0 +1,105 @@
+(* ===================================================================
+   ProVerif model: intra-domain AKA between sensor node SN_i and
+   domain gateway GW_j (Section V-C of the manuscript).
+
+   Run:   proverif intra_domain_aka.pv
+   Expected: every query reports "is true".
+
+   Adversary: Dolev-Yao on the public channel, unbounded sessions,
+   may register its own node (idE, dE) with the gateway, and learns
+   the long-term keys dSN and xGW after all sessions end (phase 1),
+   which tests perfect forward secrecy.
+   =================================================================== *)
+
+free c: channel.
+
+type scalar.
+type point.
+type key.
+
+const G: point [data].
+fun mul(scalar, point): point.
+equation forall x: scalar, y: scalar; mul(x, mul(y, G)) = mul(y, mul(x, G)).
+
+(* KDFs, AEAD with associated data, MAC *)
+fun kdf1(point, point): key.
+fun kdf2(point, point, point, point, point, bitstring, bitstring): key.
+fun aenc(bitstring, point, key): bitstring.
+reduc forall m: bitstring, a: point, k: key; adec(aenc(m, a, k), a, k) = m.
+fun mac(bitstring, key): bitstring.
+
+const lgw: bitstring.
+const lsn: bitstring.
+const idGW: bitstring.
+
+free idSN: bitstring [private].        (* honest node identity *)
+free secretS: bitstring [private].     (* data sent by SN under SK *)
+free secretG: bitstring [private].     (* data sent by GW under SK *)
+
+table regs(bitstring, point).          (* GW registration table (ID_i, D_i) *)
+
+event SNsend3(bitstring, point, point, key).
+event SNaccept(bitstring, point, point, key).
+event GWsend2(bitstring, point, point, key).
+event GWaccept(bitstring, point, point, key).
+
+(* Confidentiality and anonymity *)
+query attacker(secretS).
+query attacker(secretG).
+(* Identity is protected while long-term keys are safe. After xGW leaks,
+   recorded M1 messages reveal past identities (stated as a limitation). *)
+query attacker(idSN) phase 0.
+
+(* Mutual authentication with key agreement (injective) *)
+(* Only the honest node idSN is required to authenticate: the attacker's own
+   registered node idE legitimately completes sessions without SNsend3. *)
+query ri: point, rg: point, k: key;
+  inj-event(GWaccept(idSN, ri, rg, k)) ==> inj-event(SNsend3(idSN, ri, rg, k)).
+query id: bitstring, ri: point, rg: point, k: key;
+  inj-event(SNaccept(id, ri, rg, k)) ==> inj-event(GWsend2(id, ri, rg, k)).
+
+let SN(dSN: scalar, XGW: point) =
+  new ri: scalar;
+  let Ri = mul(ri, G) in
+  let K1 = mul(ri, XGW) in
+  let k1 = kdf1(K1, Ri) in
+  out(c, (Ri, aenc(idSN, Ri, k1)));                         (* M1 *)
+  in(c, (Rg: point, Vg: bitstring));                        (* M2 *)
+  let Z1 = mul(ri, Rg) in
+  let Z2 = mul(dSN, Rg) in
+  let SK = kdf2(K1, Z1, Z2, Ri, Rg, idSN, idGW) in
+  if Vg = mac((lgw, Ri, Rg), SK) then
+  event SNaccept(idSN, Ri, Rg, SK);
+  event SNsend3(idSN, Ri, Rg, SK);
+  out(c, mac((lsn, Ri, Rg), SK));                           (* M3 *)
+  out(c, aenc(secretS, Ri, SK)).
+
+let GW(xGW: scalar) =
+  in(c, (Ri: point, C1: bitstring));
+  let K1 = mul(xGW, Ri) in
+  let k1 = kdf1(K1, Ri) in
+  let id = adec(C1, Ri, k1) in
+  get regs(=id, Di) in
+  new rg: scalar;
+  let Rg = mul(rg, G) in
+  let Z1 = mul(rg, Ri) in
+  let Z2 = mul(rg, Di) in
+  let SK = kdf2(K1, Z1, Z2, Ri, Rg, id, idGW) in
+  event GWsend2(id, Ri, Rg, SK);
+  out(c, (Rg, mac((lgw, Ri, Rg), SK)));
+  in(c, V: bitstring);
+  if V = mac((lsn, Ri, Rg), SK) then
+  event GWaccept(id, Ri, Rg, SK);
+  if id = idSN then out(c, aenc(secretG, Rg, SK)).
+
+process
+  new dSN: scalar; new xGW: scalar;
+  new idE: bitstring; new dE: scalar;                       (* attacker's own registered node *)
+  insert regs(idSN, mul(dSN, G));
+  insert regs(idE, mul(dE, G));
+  out(c, (mul(xGW, G), idE, dE));                           (* GW public key + attacker node creds *)
+  (
+    (!SN(dSN, mul(xGW, G)))
+  | (!GW(xGW))
+  | (phase 1; out(c, (dSN, xGW)))                           (* later long-term key leak: PFS *)
+  )
